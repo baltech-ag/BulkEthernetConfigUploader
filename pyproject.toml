@@ -1,0 +1,35 @@
+[project]
+name = "becu"
+version = "0.1.0"
+description = "BulkEthernetConfigUploader: loads one configuration onto many BALTECH Ethernet readers in parallel"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "BALTECH AG", email = "info@baltech.de" }]
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    # last SDK generation with the TCP transport and the PKI secure channel in brp_lib
+    "baltech-sdk>=3.19.4,<4",
+    "wxPython>=4.2; sys_platform == 'win32'",
+]
+
+[project.scripts]
+becu = "becu.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "invoke>=2",
+]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["becu*"]
+
+[tool.uv]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
