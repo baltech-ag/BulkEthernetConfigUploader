@@ -1,0 +1,17 @@
+# environments and build output
+.venv/
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.idea/
+.vscode/
+
+# runtime output
+logs/
+reports/
+*.log

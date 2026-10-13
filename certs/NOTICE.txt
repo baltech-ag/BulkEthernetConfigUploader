@@ -1,0 +1,4 @@
+The certificate package in this folder is NOT part of the software licensed under
+the MIT license in LICENSE. It is provided for use with the BALTECH readers of this
+installation only. Do not copy, publish or redistribute it. If you find this file
+outside of its intended context, please inform info@baltech.de.
