@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import time
 from dataclasses import dataclass
 from enum import StrEnum
@@ -52,8 +53,11 @@ LEVEL0_ALLOWED = frozenset({SYS_GET_BUFFER_SIZE, SYS_GET_INFO, SYS_GET_BOOT_STAT
                             SYS_GET_FEATURES, PKI_PFS_GEN_KEY, PKI_PFS_AUTH_HOST_CERT, PKI_PFS_AUTH_RDR_CERT,
                             PKI_TUNNEL2})
 
+SYS_ERR_CFG_FULL = 0x01
 SYS_ERR_CFG_NOT_FOUND = 0x03
+SYS_ERR_INVALID_CFG_BLOCK = 0x04
 SYS_ERR_CFG_CONFIG_SECURITY_CODE = 0x0A
+STATUS_UNKNOWN_TO_HOST = 0x10        #: a Sys status byte without a class in the SDK (checked by the test)
 CFG_LOAD_CANCEL, CFG_LOAD_FINISH, CFG_LOAD_FINISH_WITH_REBOOT = 0, 1, 2
 IDLE_TIMEOUT_S = 300.0
 BUFFER_SIZE = 600
@@ -72,6 +76,34 @@ class Fault(StrEnum):
     DROP = "drop"                  #: closes the connection during the first upload, works on the retry
     MISMATCH = "mismatch"          #: reboots with the old configuration
     SLOW = "slow"                  #: handshake takes twice as long
+    # connection
+    HANG = "hang"                  #: accepts the connection, never answers the first command
+    HANG_PKI = "hang_pki"          #: answers the information commands, never answers Pki.PfsGenKey
+    HANG_UPLOAD = "hang_upload"    #: never answers the second configuration block
+    DROP_HANDSHAKE = "drop_handshake"  #: closes the connection in every handshake
+    DROP_FINISH = "drop_finish"    #: applies the configuration and reboots, the answer to CfgLoadFinish is lost
+    NEVER_RETURNS = "never_returns"    #: goes down for the reboot and never comes back
+    BUSY_TWICE = "busy_twice"      #: rejects the first two connections, then works (needs two retries)
+    POWER_CYCLE = "power_cycle"    #: loses power during the first upload: connection drops, reader boots, retry works
+    # certificate and secure channel
+    CERT_REJECTED = "cert_rejected"    #: refuses the host end certificate (invalid, revoked, expired: one answer)
+    SECLEVEL = "seclevel"          #: refuses security level 1
+    CRYPTO = "crypto"              #: key agreement fails on Pki.PfsGenKey
+    RDR_CERT_FOREIGN = "rdr_cert_foreign"  #: presents a reader certificate from another CA
+    RDR_CERT_GARBAGE = "rdr_cert_garbage"  #: presents bytes that are no certificate
+    SESSION_TIMEOUT = "session_timeout"    #: secure session expires after the first tunneled command
+    SEQCTR = "seqctr"              #: sequence counter error on the first tunneled command
+    BAD_MAC = "bad_mac"            #: wrong MAC on every tunnel answer
+    # unexpected data
+    GARBAGE = "garbage"            #: answers random bytes instead of a frame, then closes
+    UNKNOWN_STATUS = "unknown_status"  #: answers every Sys command with a status byte the host does not know
+    FW_OTHER = "fw_other"          #: Sys.GetInfo string of another product in another format
+    # configuration
+    NO_CONFIG = "no_config"        #: reader without configuration (Sys.CfgGetId: ErrCfgNotFound)
+    CFG_FULL = "cfg_full"          #: CfgLoadBlock refused with ErrCfgFull
+    FINISH_ERROR = "finish_error"  #: CfgLoadFinish refused with ErrInvalidCfgBlock
+    RESET_REFUSED = "reset_refused"    #: upload denied and Sys.FactoryReset denied too
+    SLOW_REBOOT = "slow_reboot"    #: reboot takes four times as long
 
 
 #: what the tool should report per fault (state, error class) with retries >= 1 and no factory reset
@@ -86,7 +118,34 @@ EXPECTED = {
     Fault.DROP: ("updated", ""),
     Fault.MISMATCH: ("error", "verify_mismatch"),
     Fault.SLOW: ("updated", ""),
+    Fault.HANG: ("error", "unreachable"),
+    Fault.HANG_PKI: ("error", "unreachable"),
+    Fault.HANG_UPLOAD: ("error", "upload_failed"),
+    Fault.DROP_HANDSHAKE: ("error", "busy"),
+    Fault.DROP_FINISH: ("updated", ""),
+    Fault.NEVER_RETURNS: ("error", "unreachable"),
+    Fault.BUSY_TWICE: ("error", "busy"),
+    Fault.POWER_CYCLE: ("updated", ""),
+    Fault.CERT_REJECTED: ("error", "pki_failed"),
+    Fault.SECLEVEL: ("error", "pki_failed"),
+    Fault.CRYPTO: ("error", "pki_failed"),
+    Fault.RDR_CERT_FOREIGN: ("error", "pki_failed"),
+    Fault.RDR_CERT_GARBAGE: ("error", "pki_failed"),
+    Fault.SESSION_TIMEOUT: ("error", "pki_failed"),
+    Fault.SEQCTR: ("error", "pki_failed"),
+    Fault.BAD_MAC: ("error", "pki_failed"),
+    Fault.GARBAGE: ("error", "busy"),
+    Fault.UNKNOWN_STATUS: ("error", "upload_failed"),
+    Fault.FW_OTHER: ("updated", ""),
+    Fault.NO_CONFIG: ("updated", ""),
+    Fault.CFG_FULL: ("error", "config_conflict"),
+    Fault.FINISH_ERROR: ("error", "config_conflict"),
+    Fault.RESET_REFUSED: ("error", "access_denied"),
+    Fault.SLOW_REBOOT: ("updated", ""),
 }
+
+#: faults that refuse every upload until a factory reset
+_REFUSING = frozenset({Fault.DENIED, Fault.CONFLICT, Fault.CFG_FULL, Fault.FINISH_ERROR, Fault.RESET_REFUSED})
 
 
 @dataclass
@@ -111,6 +170,7 @@ class Session:
     level: int | None = None
     session_key: bytes | None = None
     last_seq: int = 0
+    commands: int = 0                   #: tunneled commands answered in this session
 
 
 @dataclass
@@ -130,32 +190,60 @@ class _Drop(Exception):
     """Close the connection without a response (simulated connection loss)."""
 
 
+class _Hang(Exception):
+    """Never answer; keep the connection open until the host closes it."""
+
+
+class _Raw(Exception):
+    """Send these bytes instead of a frame."""
+
+    def __init__(self, data: bytes, close: bool) -> None:
+        super().__init__()
+        self.data = data
+        self.close = close
+
+
 class MockReader:
     def __init__(self, index: int, address: str, serial: str, pki: TestPki, target: tuple[str, str],
-                 initial: tuple[str, str] | None, fault: Fault = Fault.NONE, timing: Timing | None = None) -> None:
+                 initial: tuple[str, str] | None, fault: Fault = Fault.NONE, timing: Timing | None = None,
+                 port: int = 2939) -> None:
         self.index = index
         self.address = address
+        self.port = port
         self.serial = serial
         self.fault = fault
         self.timing = timing or Timing()
         self.target = target
+        if fault == Fault.NO_CONFIG:
+            initial = None
         self.factory_config = initial
         self.config: tuple[str, str] | None = target if fault == Fault.UPTODATE else initial
-        self.firmware = f"1096 NUANCE RD 2.40.03 04/01/22 {serial}"
+        if fault == Fault.FW_OTHER:
+            self.firmware = "SOME-OTHER-DEVICE v3 (build 42)"
+        else:
+            self.firmware = f"1096 NUANCE RD 2.40.03 04/01/22 {serial}"
         self.key = generate_key()
-        self.cert = pki.make_reader_cert(serial, self.key)
+        # a foreign reader certificate is signed by a CA the host does not trust
+        issuer = TestPki.generate() if fault == Fault.RDR_CERT_FOREIGN else pki
+        self.cert = issuer.make_reader_cert(serial, self.key)
         self.cert_der = self.cert.public_bytes(Encoding.DER)
         # a locked reader trusts a foreign root, so the real host chain does not verify
         self.root_cert = TestPki.generate().root_cert if fault == Fault.LOCKED else pki.root_cert
         self.stats = Stats()
         self.session: Session | None = None
+        self.server: asyncio.base_events.Server | None = None   #: set by the fleet; closed by NEVER_RETURNS
         self.connection_active = False
         self.rebooting_until = 0.0
         self.prepared = False
         self.blocks: list[bytes] = []
         self.dropped_once = False
-        #: DENIED/CONFLICT refuse every upload until a factory reset (tests may lower this to 1)
-        self.upload_refusals_left = 10**9 if fault in (Fault.DENIED, Fault.CONFLICT) else 0
+        self.rejections_left = 2 if fault == Fault.BUSY_TWICE else 0
+        #: refusing faults refuse every upload until a factory reset (tests may lower this to 1)
+        self.upload_refusals_left = 10**9 if fault in _REFUSING else 0
+
+    @property
+    def endpoint(self) -> str:
+        return f"{self.address}:{self.port}"
 
     # ---- connection -------------------------------------------------------------------------------
 
@@ -173,12 +261,19 @@ class MockReader:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
         writer.close()
 
+    @staticmethod
+    async def _wait_for_disconnect(reader: asyncio.StreamReader) -> None:
+        with contextlib.suppress(Exception):
+            while await reader.read(4096):
+                pass
+
     async def serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         if self.is_rebooting():
             self.stats.rejected_rebooting += 1
             self._reject(writer)
             return
-        if self.connection_active or self.fault == Fault.BUSY:
+        if self.connection_active or self.fault == Fault.BUSY or self.rejections_left > 0:
+            self.rejections_left = max(0, self.rejections_left - 1)
             self.stats.rejected_busy += 1
             self._reject(writer)
             return
@@ -192,13 +287,19 @@ class MockReader:
                     break
                 except FrameError as e:
                     self.stats.frame_errors += 1
-                    logger.warning("%s: %s", self.address, e)
+                    logger.warning("%s: %s", self.endpoint, e)
                     break
                 try:
                     status, payload, close_after = await self.execute(cmd, tunneled=False)
+                    data = build_response(cmd.cmd_code, status, payload)
                 except _Drop:
                     break
-                writer.write(build_response(cmd.cmd_code, status, payload))
+                except _Hang:
+                    await self._wait_for_disconnect(reader)
+                    break
+                except _Raw as raw:
+                    data, close_after = raw.data, raw.close
+                writer.write(data)
                 try:
                     await writer.drain()
                 except ConnectionError:
@@ -213,6 +314,12 @@ class MockReader:
 
     async def execute(self, cmd: CommandFrame, tunneled: bool) -> tuple[int, bytes, bool]:
         """Returns (status, payload, close_after_response)."""
+        if self.fault == Fault.HANG:
+            raise _Hang()
+        if self.fault == Fault.GARBAGE:
+            raise _Raw(os.urandom(32), close=True)
+        if self.fault == Fault.UNKNOWN_STATUS and cmd.device_code == 0:
+            return self._status(STATUS_UNKNOWN_TO_HOST)
         if not tunneled and cmd.cmd_code not in LEVEL0_ALLOWED:
             return self._status(STATUS_ACCESS_DENIED)
         handler = self._handlers().get(cmd.cmd_code)
@@ -249,11 +356,17 @@ class MockReader:
             await asyncio.sleep(delay)
 
     def _schedule_reboot(self, seconds: float) -> None:
+        if self.fault == Fault.SLOW_REBOOT:
+            seconds *= 4
         self.rebooting_until = time.monotonic() + self.timing.seconds(seconds)
         self.session = None
         self.prepared = False
         self.blocks = []
         self.stats.reboots += 1
+        if self.fault == Fault.NEVER_RETURNS:
+            self.rebooting_until = float("inf")
+            if self.server is not None:
+                self.server.close()     # no listener any more: the host gets "connection refused"
 
     # ---- Sys commands -----------------------------------------------------------------------------
 
@@ -278,7 +391,7 @@ class MockReader:
         return STATUS_OK, payload + MAX_FEATURE_ID.to_bytes(2, "big"), False
 
     async def sys_cfg_load_prepare(self, params: bytes) -> tuple[int, bytes, bool]:
-        if self.fault == Fault.DENIED and self.upload_refusals_left:
+        if self.fault in (Fault.DENIED, Fault.RESET_REFUSED) and self.upload_refusals_left:
             self.upload_refusals_left -= 1
             return self._status(STATUS_ACCESS_DENIED)
         self.prepared = True
@@ -292,9 +405,18 @@ class MockReader:
         if self.fault == Fault.CONFLICT and self.upload_refusals_left:
             self.upload_refusals_left -= 1
             return self._status(SYS_ERR_CFG_CONFIG_SECURITY_CODE)
+        if self.fault == Fault.CFG_FULL and self.upload_refusals_left:
+            self.upload_refusals_left -= 1
+            return self._status(SYS_ERR_CFG_FULL)
         if self.fault == Fault.DROP and not self.dropped_once and len(self.blocks) >= 1:
             self.dropped_once = True
             raise _Drop()
+        if self.fault == Fault.POWER_CYCLE and not self.dropped_once and len(self.blocks) >= 1:
+            self.dropped_once = True
+            self._schedule_reboot(self.timing.reboot / 2)   # short, so the default retry delay of 5 s suffices
+            raise _Drop()
+        if self.fault == Fault.HANG_UPLOAD and len(self.blocks) >= 1:
+            raise _Hang()
         await self._sleep(len(data) * self.timing.per_block_byte)
         self.blocks.append(data)
         return STATUS_OK, b"", False
@@ -305,8 +427,14 @@ class MockReader:
             self.prepared = False
             self.blocks = []
             return STATUS_OK, b"", False
+        if self.fault == Fault.FINISH_ERROR and self.upload_refusals_left:
+            self.upload_refusals_left -= 1
+            return self._status(SYS_ERR_INVALID_CFG_BLOCK)
         self._apply_uploaded_config()
         if action == CFG_LOAD_FINISH_WITH_REBOOT:
+            if self.fault == Fault.DROP_FINISH:
+                self._schedule_reboot(self.timing.reboot / 2)   # the reader reboots, the host never sees the answer
+                raise _Drop()
             self._schedule_reboot(self.timing.reboot)
             return STATUS_OK, b"", True
         return STATUS_OK, b"", False
@@ -323,6 +451,8 @@ class MockReader:
         return STATUS_OK, b"", True
 
     async def sys_factory_reset(self, params: bytes) -> tuple[int, bytes, bool]:
+        if self.fault == Fault.RESET_REFUSED:
+            return self._status(STATUS_ACCESS_DENIED)
         self.stats.factory_resets += 1
         self.config = self.factory_config
         self.upload_refusals_left = 0      # the conflict is gone after a factory reset
@@ -332,6 +462,10 @@ class MockReader:
     # ---- PKI commands -----------------------------------------------------------------------------
 
     async def pki_pfs_gen_key(self, params: bytes) -> tuple[int, bytes, bool]:
+        if self.fault == Fault.HANG_PKI:
+            raise _Hang()
+        if self.fault == Fault.CRYPTO:
+            return self._status(PKI_ERR_CRYPTO)
         if len(params) < 2 or len(params) != 2 + int.from_bytes(params[:2], "big"):
             return self._status(STATUS_INVALID_COMMAND)
         try:
@@ -349,6 +483,10 @@ class MockReader:
         session = self.session
         if session is None or session.session_key is not None:
             return self._status(PKI_ERR_CRYPTO)
+        if self.fault == Fault.DROP_HANDSHAKE:
+            raise _Drop()
+        if self.fault == Fault.SECLEVEL:
+            return self._status(PKI_ERR_SECLEVEL_UNSUPPORTED)
         if len(params) < 2 or len(params) != 2 + int.from_bytes(params[:2], "big"):
             return self._status(STATUS_INVALID_COMMAND)
         try:
@@ -381,6 +519,8 @@ class MockReader:
             verify_signature(issuer.public_key(), cert)
         except InvalidSignature:
             return self._status(PKI_ERR_CERT)
+        if is_end and self.fault == Fault.CERT_REJECTED:
+            return self._status(PKI_ERR_CERT)     # a real reader answers the same for invalid, revoked or expired
         session.chain.append(cert)
         if is_end:
             shared_2 = ecdh(self.key, cert.public_key())[:16]
@@ -394,7 +534,8 @@ class MockReader:
         if session is None or session.level is None:
             return self._status(PKI_ERR_CRYPTO)
         await self._sleep(self.timing.pfs_auth_rdr_cert * (2 if self.fault == Fault.SLOW else 1))
-        plain = len(self.cert_der).to_bytes(2, "big") + self.cert_der
+        cert_der = os.urandom(len(self.cert_der)) if self.fault == Fault.RDR_CERT_GARBAGE else self.cert_der
+        plain = len(cert_der).to_bytes(2, "big") + cert_der
         encrypted = aes_cbc_encrypt(session.auth_key, session.auth_iv, plain)
         return STATUS_OK, len(encrypted).to_bytes(2, "big") + encrypted, False
 
@@ -402,6 +543,10 @@ class MockReader:
         session = self.session
         if session is None or session.session_key is None:
             return self._status(PKI_ERR_SESSION_TIMEOUT)
+        if self.fault == Fault.SESSION_TIMEOUT and session.commands >= 1:
+            return self._status(PKI_ERR_SESSION_TIMEOUT)
+        if self.fault == Fault.SEQCTR:
+            return self._status(PKI_ERR_SEQCTR)
         if len(params) < 22:
             return self._status(STATUS_INVALID_COMMAND)
         seq = int.from_bytes(params[0:4], "big")
@@ -429,7 +574,10 @@ class MockReader:
             return self._status(STATUS_INVALID_COMMAND)
         inner = CommandFrame(0, inner_code, inner_params)
         status, payload, close_after = await self.execute(inner, tunneled=True)
+        session.commands += 1
         plain_resp = bytes([status]) + len(payload).to_bytes(2, "big") + payload
         enc_resp = aes_cbc_encrypt(key, seq_iv(0x40, seq), plain_resp)
         resp_mac = cbc_mac(key, seq_iv(0x80, seq), enc_resp)
+        if self.fault == Fault.BAD_MAC:
+            resp_mac = bytes([resp_mac[0] ^ 0xFF]) + resp_mac[1:]
         return STATUS_OK, resp_mac + len(enc_resp).to_bytes(2, "big") + enc_resp, close_after

@@ -92,6 +92,28 @@ uv run python -m becu.cli --csv mock/readers.csv --config project.bec --cert moc
 `--time-scale 0` removes all simulated delays. Measured with 1800 readers, real timing and
 50 starts per second: 143 s for the whole run, 34 s per reader, every result as expected.
 
+`--faults` takes any of the 33 fault names that `python -m mock --help` lists: connection
+faults (hang, drops in every phase, a reader that never returns after the reboot, power
+cycle, busy), certificate and secure-channel faults (rejected host certificate, unsupported
+security level, foreign or unparseable reader certificate, session timeout, sequence counter,
+bad MAC), unexpected data (garbage instead of a frame, unknown status byte, foreign firmware
+string) and configuration faults (no configuration, full store, refused finish, refused
+factory reset, slow reboot). `tests/test_mock_fleet.py` runs the tool against one reader per
+fault and checks every result against `expected.csv`.
+
+To run the fleet on another machine and the tool on this one:
+
+```
+uv run python -m mock --count 1800 --bind auto --jitter 0.3 --bec project.bec
+```
+
+serves the readers on the machine's own address (`auto` = the address on the default route,
+printed at start; `--bind 192.168.1.50` names one), ports 2939, 2940, ...; the address column
+of `readers.csv` then carries `ip:port`. With `--addresses 10.10.8.0/21` (a block the machine
+owns) every reader gets its own address on port 2939, like real readers. Copy
+`mock/readers.csv` and `mock/test_pki/PKI_AUTH_BECU_TEST.zip` to the machine with the tool and
+select them there. `--jitter 0.3` varies the timing of each reader by up to 30 %.
+
 See `certs/README.md` for the certificate package.
 Timing facts for the target readers (Kofax Ethernet card reader, firmware 1096 2.40.03): PKI handshake
 about 21 s, upload about 16 ms per configuration byte, reboot about 5 s, one TCP session
