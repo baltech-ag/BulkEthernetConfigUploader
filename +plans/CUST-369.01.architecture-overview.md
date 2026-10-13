@@ -321,7 +321,18 @@ excluded from "the Software", MIT compatibility is not affected.
    Python and packages, later 2 s, repair of a broken `.venv`), path-length check (launcher
    fails above ~150 characters). `invoke installer` builds the PyInstaller folder with GUI and CLI and the per-user
    installer (3.4).
-4. **Mock fleet and load test:** 1800 mock readers, measure total runtime and retries.
+4. **Mock fleet and load test (done):** `mock/` (brp framing, crypto, test PKI,
+   reader state machine with faults and real timing, asyncio fleet with CLI). The real
+   brp_lib PKI layer handshakes with the Python mock (integration tests in
+   `tests/test_mock_fleet.py`). Load test with 1800 readers, real timing, 50 starts/s,
+   faults uptodate 100, unreachable 10, busy 5, locked 5, denied 3, conflict 3, drop 5,
+   mismatch 2, slow 20: 1772 updated, 28 errors, every result as expected, 143 s total,
+   34.4 s average per reader (max 54 s for slow readers). Found and fixed on the way: a
+   tunneled general status 0x42/0x41 reaches the SDK as an unknown device code (registered
+   in the SDK's error map), a connection reset right after connect is reported as frame
+   error (mapped to "busy"), reboot polling tolerates garbled or dropped connections, and
+   baltech-sdk 3.19.4 registers `HostCertificateFormatError` under 0x40000012 while brp_lib
+   returns 0x4000012 (mapped, so a rejected host certificate is reported by name).
 5. **Later:** factory-reset-and-retry polish.
 
 ## 5. Open points

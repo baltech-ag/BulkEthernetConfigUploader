@@ -15,3 +15,8 @@ __pycache__/
 logs/
 reports/
 *.log
+
+# mock fleet output (generated test PKI, reader lists)
+mock/test_pki/
+mock/readers.csv
+mock/expected.csv

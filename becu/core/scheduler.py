@@ -174,6 +174,7 @@ class Scheduler:
         interval = 1.0 / self.options.start_rate
         tick = min(0.02, interval)
         next_start = 0.0
+        next_reap = 0.0
         limit = self.options.max_parallel or max(1, len(self.targets))
         try:
             while True:
@@ -184,9 +185,12 @@ class Scheduler:
                         delayed.remove(item)
                 for item in due:
                     queue.append((item[1], item[2]))
-                for address, thread in list(running.items()):
-                    if not thread.is_alive():
-                        del running[address]
+                if now >= next_reap or not queue:
+                    # scanning 1800 threads on every iteration slows the ramp down; reap 4 times a second
+                    for address, thread in list(running.items()):
+                        if not thread.is_alive():
+                            del running[address]
+                    next_reap = now + 0.25
                 if self._stop.is_set():
                     queue.clear()
                     with delayed_lock:

@@ -78,6 +78,20 @@ uv run inv installer        # builds dist/BulkEthernetConfigUploader-<version>-s
 (certificate package included) and wraps that folder with Inno Setup into the per-user installer.
 Inno Setup must be installed on the build PC: `winget install -e --id JRSoftware.InnoSetup`.
 
+### Load test with the mock reader fleet
+
+`mock/` simulates Kofax Ethernet card readers on loopback addresses (BRP over TCP, PKI secure channel,
+BEC upload, real timing). It generates its own test certificates in `mock/test_pki/`.
+
+```
+uv run python -m mock --count 1800 --bec project.bec --faults uptodate=100,unreachable=10,busy=5,locked=5,denied=3,conflict=3,drop=5,mismatch=2,slow=20
+uv run python -m becu.cli --csv mock/readers.csv --config project.bec --cert mock/test_pki/PKI_AUTH_BECU_TEST.zip --start-rate 50 --auto-confirm
+```
+
+`mock/expected.csv` lists the state and error class the tool should report per reader.
+`--time-scale 0` removes all simulated delays. Measured with 1800 readers, real timing and
+50 starts per second: 143 s for the whole run, 34 s per reader, every result as expected.
+
 See `certs/README.md` for the certificate package.
 Timing facts for the target readers (Kofax Ethernet card reader, firmware 1096 2.40.03): PKI handshake
 about 21 s, upload about 16 ms per configuration byte, reboot about 5 s, one TCP session

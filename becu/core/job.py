@@ -17,7 +17,7 @@ from .bec_file import BecFile
 from .csv_import import ReaderTarget
 from .errors import (
     AccessDeniedError, BusyError, ConfigConflictError, ErrorClass, ReaderError,
-    RebootTimeoutError, UnreachableError, VerifyMismatchError,
+    RebootTimeoutError, UnreachableError, UploadError, VerifyMismatchError,
 )
 from .session_api import ReaderInfo, Session, SessionFactory
 
@@ -121,8 +121,8 @@ class ReaderJob:
         while time.monotonic() < deadline:
             try:
                 info = self._read_plain()
-            except (UnreachableError, BusyError) as e:
-                last_error = e
+            except (UnreachableError, BusyError, UploadError) as e:
+                last_error = e      # not reachable, connection dropped or garbled while booting: poll again
             else:
                 last_info = info
                 if self.bec.matches(info.config_id):
@@ -177,7 +177,7 @@ class ReaderJob:
             try:
                 self._read_plain()
                 return
-            except (UnreachableError, BusyError):
+            except (UnreachableError, BusyError, UploadError):
                 time.sleep(self.options.reboot_poll)
         raise RebootTimeoutError(f"no answer within {self.options.reboot_timeout:.0f} s after the factory reset")
 

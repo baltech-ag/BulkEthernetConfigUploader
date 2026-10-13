@@ -50,6 +50,44 @@ def _text(e: BaseException) -> str:
     return f"{type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}".strip(": ")
 
 
+_ERRGRP_DEVICE = 0x00010000
+_GENERAL_STATUS_INVALID_CMD = 0x41
+_GENERAL_STATUS_ACCESS_DENIED = 0x42
+
+
+class TunneledInvalidCommand(sdk.StatusCodeError):
+    """Sys command inside the PKI tunnel answered with the general status 0x41 (command unknown)."""
+    ErrorCode = _ERRGRP_DEVICE | _GENERAL_STATUS_INVALID_CMD
+
+
+class TunneledAccessDenied(sdk.StatusCodeError):
+    """Sys command inside the PKI tunnel answered with the general status 0x42 (access denied)."""
+    ErrorCode = _ERRGRP_DEVICE | _GENERAL_STATUS_ACCESS_DENIED
+
+
+# brp_lib 3.19 reports these codes only for commands inside the tunnel; the SDK has no class for
+# them and would raise a bare StatusCodeError without the code. Register them in its factory.
+sdk.StatusCodeError.StatusCodeMap.setdefault(TunneledInvalidCommand.ErrorCode, TunneledInvalidCommand)
+sdk.StatusCodeError.StatusCodeMap.setdefault(TunneledAccessDenied.ErrorCode, TunneledAccessDenied)
+
+# baltech-sdk 3.19.4 registers HostCertificateFormatError under 0x40000012, but brp_lib returns
+# BRP_ERR_HOST_CERT_FORMAT as 0x4000012 (the reader rejected the host certificate). Map the real code.
+_BRP_ERR_HOST_CERT_FORMAT = 0x4000012
+sdk.StatusCodeError.StatusCodeMap.setdefault(_BRP_ERR_HOST_CERT_FORMAT, sdk.HostCertificateFormatError)
+
+
+def _device_status(e: BaseException) -> int | None:
+    """Status byte of a device error code (BRP_ERRGRP_DEVICE | device code << 8 | status), else None.
+
+    Inside the PKI tunnel brp_lib reports the general status codes 0x41/0x42 this way instead of
+    raising UnsupportedCommandError/CommandDeniedError.
+    """
+    code = getattr(e, "ErrorCode", None)
+    if isinstance(code, int) and (code & 0xFFFFFF00) == _ERRGRP_DEVICE:   # device code 0x00 = Sys
+        return code & 0xFF
+    return None
+
+
 class SdkSession:
     def __init__(self, address: str, pki_zip: Path | None, session_timeout_ms: int = 0) -> None:
         self.address = address
@@ -78,6 +116,9 @@ class SdkSession:
         except _CONNECTION_LOST as e:
             raise BusyError(f"{self.address} closed the connection; another host may be connected ({_text(e)})",
                             cause=e) from None
+        except sdk.HostCertificateFormatError as e:
+            raise PkiError(f"{self.address} rejected the host certificate; the reader is locked to another "
+                           f"certificate authority or the package does not fit ({_text(e)})", cause=e) from None
         except _PKI_ERRORS as e:
             raise PkiError(f"PKI handshake with {self.address} failed ({_text(e)})", cause=e) from None
         except sdk.CommandDeniedError as e:
@@ -85,6 +126,11 @@ class SdkSession:
         except sdk.ComTimeoutError as e:
             raise UnreachableError(f"{self.address} did not answer during the {'handshake' if pki else 'connect'} "
                                    f"({_text(e)})", cause=e) from None
+        except sdk.ComFrameFormatError as e:
+            # after the certificate classes above: a connection that drops inside the handshake arrives
+            # as frame error, which is a connection problem and worth a retry
+            raise BusyError(f"{self.address} closed the connection or answered garbage during the "
+                            f"{'handshake' if pki else 'connect'} ({_text(e)})", cause=e) from None
         except sdk.StatusCodeError as e:
             kind = PkiError if pki else BusyError
             raise kind(f"opening {self.address} failed ({_text(e)})", cause=e) from None
@@ -131,7 +177,10 @@ class SdkSession:
             try:
                 brp.Sys_CfgLoadPrepare("Default")
                 prepared = True
-            except sdk.UnsupportedCommandError:
+            except Exception as e:  # noqa: BLE001 - only "unsupported command" selects the fallback
+                if not (isinstance(e, sdk.UnsupportedCommandError)
+                        or _device_status(e) == _GENERAL_STATUS_INVALID_CMD):
+                    raise
                 logger.debug("%s: Sys.CfgLoadPrepare not supported, using blocks + reset", self.address)
             total = bec.block_count
             for i, block in enumerate(bec.blocks, start=1):
@@ -162,23 +211,33 @@ class SdkSession:
         if isinstance(e, _CONNECTION_LOST):
             return BusyError(f"{self.address}: connection lost while {what} ({_text(e)})", cause=e)
         if isinstance(e, sdk.ComTimeoutError):
-            return BusyError(f"{self.address}: no answer while {what} ({_text(e)})", cause=e)
-        if isinstance(e, sdk.CommandDeniedError):
+            # accepted the connection but never answered: like "did not answer" in the handshake
+            return UnreachableError(f"{self.address}: no answer while {what} ({_text(e)})", cause=e)
+        if isinstance(e, sdk.ComFrameFormatError):
+            # brp_lib reports both a closed connection (EOF) right after the connect and bytes that
+            # are no BRP frame as frame error
+            return BusyError(f"{self.address}: connection closed or answer not understood while {what} "
+                             f"({_text(e)})", cause=e)
+        if isinstance(e, sdk.CommandDeniedError) or _device_status(e) == _GENERAL_STATUS_ACCESS_DENIED:
             return AccessDeniedError(f"{self.address}: access denied while {what} ({_text(e)})", cause=e)
         return UploadError(f"{self.address}: {what} failed ({_text(e)})", cause=e)
 
     def _map_upload_error(self, e: BaseException, what: str = "upload") -> ReaderError:
-        if isinstance(e, sdk.CommandDeniedError):
+        status = _device_status(e)
+        if isinstance(e, sdk.CommandDeniedError) or status == _GENERAL_STATUS_ACCESS_DENIED:
             return AccessDeniedError(f"{self.address}: {what} refused, access denied at this security level "
                                      f"({_text(e)})", cause=e)
         if isinstance(e, _CONFIG_CONFLICTS):
             return ConfigConflictError(f"{self.address}: reader refused the configuration ({_text(e)})", cause=e)
-        if isinstance(e, sdk.UnsupportedCommandError):
+        if isinstance(e, sdk.UnsupportedCommandError) or status == _GENERAL_STATUS_INVALID_CMD:
             return ConfigConflictError(f"{self.address}: command not supported by this firmware ({_text(e)})", cause=e)
         if isinstance(e, _PKI_ERRORS):
             return PkiError(f"{self.address}: secure session failed during {what} ({_text(e)})", cause=e)
         if isinstance(e, (sdk.OpenIOError, *_CONNECTION_LOST, sdk.ComTimeoutError)):
             return UploadError(f"{self.address}: connection problem during {what} ({_text(e)})", cause=e)
+        if isinstance(e, api.PkiError):
+            # Pki.ErrSessionTimeout and the like inside the tunnel: the secure session is gone
+            return PkiError(f"{self.address}: secure session failed during {what} ({_text(e)})", cause=e)
         if isinstance(e, api.BaltechApiError):
             # another reader status code: let the operator look, do not retry blindly
             return ConfigConflictError(f"{self.address}: reader reported {_text(e)} during {what}", cause=e)
