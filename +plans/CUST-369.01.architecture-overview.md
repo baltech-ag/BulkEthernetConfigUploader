@@ -19,9 +19,11 @@ BEC uploads; the original configuration was restored and verified).
 | D9 | Tests | Spike on the test reader done (2.4). Mock reader fleet (1800 instances) is in scope, see 3.6. |
 | D10 | SDK | baltech-sdk 3.19.4, `Brp(Tcp("ip:port"), crypto=PKI(zip))`. Port parsing verified in the C source, on the device (2939) and with a local listener (12345); see 2.1. |
 | D11 | Target and language | Windows x64 customer PC (mirror built for cp313 win_amd64). No VLAN limits assumed. UI and README in American English. |
-| D12 | Timing numbers | The measured durations in section 1 and 2.4 are estimates only. The code does not contain them: command timeouts are the SDK defaults, the reboot wait is a generous poll window. The mock fleet uses them only as default delays. |
-| D13 | Progress display | No estimated time left. Hard numbers only: pending, handshaking, updating, rebooting, updated, errors, plus total and elapsed time. Readers that already carry the target config count as updated with the per-reader status "already up to date". |
+| D12 | Timing numbers | The measured durations in section 1 and 2.4 are estimates only. The run does not use them: command timeouts are the SDK defaults, the reboot wait is a generous poll window. They appear in the code only as the constants of the duration estimate (`becu/core/estimate.py`) and as default delays of the mock fleet. |
+| D13 | Progress display | No estimated time left during the run. Hard numbers only: pending, handshaking, updating, rebooting, updated, errors, plus total and elapsed time. Before the start, GUI and CLI show a rough estimate of the whole duration (reader count, start rate, parallel limit, configuration size) with its assumptions; retries and errors are excluded. Readers that already carry the target config count as updated with the per-reader status "already up to date". |
 | D14 | Reader list | No table of all readers in the UI. The UI shows an errors list only (IP, port, serial, error, retries) with "Retry errors". The complete per-reader result (all rows, all columns) goes to the CSV report and the log. |
+| D15 | Automation | The GUI shows the `python -m becu.cli` call equivalent to the current settings in a read-only field with a Copy button, so the customer can script the update. Paths are always quoted, columns are passed as 0-based indices, `--auto-confirm` replaces the confirmation prompt. `Start.cmd` reports its steps and closes two seconds after the GUI has started. |
+| D16 | Stored settings | None. The GUI keeps nothing between sessions: every start shows the defaults (all readers in parallel, 10 starts per second, one retry, plain access on, no factory reset), the certificate from `certs/` preselected and no files from an earlier session. |
 
 ## 1. Context
 
@@ -91,11 +93,15 @@ port of internal crypto code with an open issue, not feasible in the time availa
 
 - Python stdlib `csv` + `csv.Sniffer` (delimiter `,`/`;`/tab, `has_header()`), UTF-8 with
   BOM and cp1252 fallback.
-- Header detection is a heuristic. The UI shows the result as a checkbox "First row is a
-  header" that the user can override. Without header the columns are named "Column 1..n".
+- Header detection is a heuristic (first row has no IPv4 in the column where the other
+  rows have most). No override in the UI: a first row that is not an address is either a
+  header (dropped) or an invalid row (skipped), so the outcome is the same. The UI shows
+  "header row detected" / "no header row". The CLI keeps `--header/--no-header` and takes
+  columns as 0-based indices (`--ip-column N`, `--port-column N`); the GUI names the columns
+  of a file without header "Column 0..n-1", the same index.
 - IP column dropdown; values `a.b.c.d` or `a.b.c.d:port`. If no value in the IP column
-  carries a port, a second dropdown "Port column (optional)" appears. Port precedence:
-  `IP:port` > port column > default port (2939, editable).
+  carries a port, a second dropdown "Port column (optional, otherwise 2939)" appears. Port
+  precedence: `IP:port` > port column > 2939 (changeable only via the CLI `--default-port`).
 - Validation report before start: invalid rows, duplicates, empty cells, row count.
 
 ### 2.3 Encrypted connection with the transport certificate — verified on the device
@@ -146,8 +152,10 @@ port of internal crypto code with an open issue, not feasible in the time availa
 
 - Layering: `core` library → `cli` (argparse, for tests and automation) → `gui` (wxPython).
   `Start.cmd` starts the GUI; the CLI is `python -m becu.cli` inside the environment.
-- Parallelism controls (D7): "Max. parallel readers" (default all) and "Start rate
-  (readers/s)" (default 10). No mode switch.
+- Parallelism controls (D7): "Max. parallel readers" (default all) and "Start up to N
+  readers per second" (default 10, 1000 = nearly all at once). "Automatic retries for
+  temporary errors" (default 1) with a tooltip that lists what is retried. No mode switch.
+  `Start.cmd` launches the GUI with pythonw and closes its console window.
 - Progress (D13, D14): one overall bar (updated + errors of total) and six counters:
   pending, handshaking, updating, rebooting, updated, errors; plus total and elapsed time.
   No estimated time left. Below it an errors list (IP, port, serial, error, retries) with
@@ -202,7 +210,7 @@ BulkEthernetConfigUploader/
       logsetup.py           file + queue handlers, levels
     cli.py                  python -m becu.cli
     gui/
-      app.py, main_frame.py, error_list.py, log_panel.py, settings.py
+      app.py, main_frame.py, error_list.py, log_panel.py
   mock/                     mock reader fleet for load tests (see 3.6), test PKI generator
   certs/                    README.md, NOTICE.txt, PKI_AUTH_BALTECH_FOR_KOFAX_TRANSPORT.zip
   tests/                    unit tests (csv, bec, scheduler with fake session, mock reader)
@@ -304,8 +312,15 @@ excluded from "the Software", MIT compatibility is not affected.
    `test` and `run`. Verified on the test reader: "already up to date" path, update to a
    second configuration (31 s), restore of the original (35 s), unreachable address with
    retry (exit code 1).
-3. **GUI + deliverable:** wx main window (inputs, run panel with counters, errors list,
-   log panel), `Start.cmd` with the installed uv, `invoke installer`, README, LICENSE, NOTICE.
+3. **GUI + deliverable (done):** wx main window (`becu/gui/`: inputs with
+   automatic header detection and column selection, options, run panel with the six
+   counters, errors list, log panel with level filter; no stored settings, every start
+   begins with the defaults and the certificate from `certs/`; minimum window size derived
+   from the layout and small enough for a 1366x768 screen), GUI smoke test with the
+   fake fleet, GUI code path verified on the test reader. `Start.cmd` with the installed uv (first start downloads
+   Python and packages, later 2 s, repair of a broken `.venv`), path-length check (launcher
+   fails above ~150 characters). `invoke installer` builds the PyInstaller folder with GUI and CLI and the per-user
+   installer (3.4).
 4. **Mock fleet and load test:** 1800 mock readers, measure total runtime and retries.
 5. **Later:** factory-reset-and-retry polish.
 

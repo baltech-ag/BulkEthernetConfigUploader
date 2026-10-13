@@ -12,23 +12,17 @@ dependencies = [
     "wxPython>=4.2; sys_platform == 'win32'",
 ]
 
-[project.scripts]
-becu = "becu.cli:main"
-
 [dependency-groups]
 dev = [
     "pytest>=8",
     "invoke>=2",
+    "pyinstaller>=6.22.3",
 ]
 
-[build-system]
-requires = ["setuptools>=77"]
-build-backend = "setuptools.build_meta"
-
-[tool.setuptools.packages.find]
-include = ["becu*"]
-
 [tool.uv]
+# The project is run from its folder (python -m becu.cli / becu.gui) and is never built or
+# installed.
+package = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
