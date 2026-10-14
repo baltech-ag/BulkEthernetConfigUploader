@@ -268,6 +268,10 @@ default folder) wraps the folder into `dist/BulkEthernetConfigUploader-<version>
 per-user installation under `%LOCALAPPDATA%\Programs`, no administrator rights, Start menu
 entry, uninstaller, NOTICE shown before the installation. No code signing.
 
+`.github/workflows/installer.yml` runs the tests and `invoke installer` on a Windows runner for
+every tag `vX.Y.Z` (checked against the version in `pyproject.toml`) and attaches the setup.exe
+to the GitHub release of the tag; a manual run keeps it as workflow artifact.
+
 Handover: the repository and the installer.
 
 ### 3.5 Non-goals (first version)

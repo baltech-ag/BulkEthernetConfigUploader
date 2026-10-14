@@ -77,6 +77,8 @@ uv run inv installer        # builds dist/BulkEthernetConfigUploader-<version>-s
 `inv installer` bundles the GUI and the CLI with PyInstaller into `dist/BulkEthernetConfigUploader/`
 (certificate package included) and wraps that folder with Inno Setup into the per-user installer.
 Inno Setup must be installed on the build PC: `winget install -e --id JRSoftware.InnoSetup`.
+A pushed tag `vX.Y.Z` that matches the version in `pyproject.toml` makes GitHub Actions build
+the installer and attach it to the release of that tag (`.github/workflows/installer.yml`).
 
 ### Load test with the mock reader fleet
 

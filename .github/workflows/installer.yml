@@ -1,0 +1,68 @@
+# Builds the Windows installer for every version tag (v0.1.0, v0.2.0, ...) and attaches it to the
+# GitHub release of that tag. A manual run (workflow_dispatch) only builds and keeps the installer
+# as a workflow artifact.
+name: Installer
+
+on:
+  push:
+    tags: ["v[0-9]*"]
+  workflow_dispatch:
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install the project environment
+        run: uv sync --frozen
+
+      - name: Run the tests
+        run: uv run pytest -q
+
+      - name: Check that the tag matches the version in pyproject.toml
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          version=$(uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match the version ${version} in pyproject.toml"
+            exit 1
+          fi
+
+      - name: Install Inno Setup if the runner image lacks it
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Build the installer
+        run: uv run inv installer
+
+      - name: Keep the installer as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: dist/BulkEthernetConfigUploader-*-setup.exe
+          if-no-files-found: error
+
+      - name: Attach the installer to the release of this tag
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          exe=$(ls dist/BulkEthernetConfigUploader-*-setup.exe)
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "$exe" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" "$exe" \
+              --title "BulkEthernetConfigUploader ${GITHUB_REF_NAME#v}" \
+              --notes "Windows installer, per-user, no administrator rights. Run the setup.exe; the sources are this tag."
+          fi
